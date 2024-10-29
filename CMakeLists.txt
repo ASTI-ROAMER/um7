@@ -30,6 +30,15 @@ add_executable(um7_driver src/main.cpp src/registers.cpp src/comms.cpp)
 target_link_libraries(um7_driver ${catkin_LIBRARIES} )
 add_dependencies(um7_driver um7_generate_messages_cpp)
 
+add_executable(find_baud src/find_baud.cpp src/registers.cpp src/comms.cpp)
+target_link_libraries(find_baud ${catkin_LIBRARIES} )
+
+add_executable(force_change_baud src/force_change_baud.cpp src/registers.cpp src/comms.cpp)
+target_link_libraries(force_change_baud ${catkin_LIBRARIES} )
+
+add_executable(flash_only src/flash_only.cpp src/registers.cpp src/comms.cpp)
+target_link_libraries(flash_only ${catkin_LIBRARIES} )
+
 #############
 ## Install ##
 #############

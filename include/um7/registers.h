@@ -169,16 +169,22 @@ class Registers
       quat(this, DREG_QUAT_AB, 4, 0.0000335693),
       temperature(this, DREG_TEMPERATURE, 1),
       communication(this, CREG_COM_SETTINGS, 1),
+      comrate1(this, CREG_COM_RATES1, 1),
       comrate2(this, CREG_COM_RATES2, 1),
+      comrate3(this, CREG_COM_RATES3, 1),
       comrate4(this, CREG_COM_RATES4, 1),
       comrate5(this, CREG_COM_RATES5, 1),
       comrate6(this, CREG_COM_RATES6, 1),
+      comrate7(this, CREG_COM_RATES7, 1),
       misc_config(this, CREG_MISC_SETTINGS, 1),
       status(this, CREG_COM_RATES6, 1),
       mag_bias(this, CREG_MAG_BIAS_X, 3),
+      cmd_get_fw_revision(this, CHR_GET_FW_VERSION, 1),
+      cmd_flash_commit(this, CHR_FLASH_COMMIT),
       cmd_zero_gyros(this, CHR_ZERO_GYROS),
       cmd_reset_ekf(this, CHR_RESET_EKF),
-      cmd_set_mag_ref(this, CHR_SET_MAG_REFERENCE)
+      cmd_set_mag_ref(this, CHR_SET_MAG_REFERENCE),
+      health(this, DREG_HEALTH, 1)
     {
       memset(raw_, 0, sizeof(raw_));
     }
@@ -189,13 +195,13 @@ class Registers
     const Accessor<float> gyro, accel, mag, temperature;
 
     // Configs
-    const Accessor<uint32_t> communication, misc_config, status, comrate2,
-                            comrate4, comrate5, comrate6;
+    const Accessor<uint32_t> communication, misc_config, status, comrate1, comrate2,
+                            comrate3, comrate4, comrate5, comrate6, comrate7;
 
     const Accessor<float>  mag_bias;
 
     // Commands
-    const Accessor<uint32_t> cmd_zero_gyros, cmd_reset_ekf, cmd_set_mag_ref;
+    const Accessor<uint32_t> cmd_get_fw_revision, cmd_flash_commit, cmd_zero_gyros, cmd_reset_ekf, cmd_set_mag_ref, health;
 
     void write_raw(uint8_t register_index, std::string data)
     {

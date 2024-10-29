@@ -44,6 +44,7 @@
 #include "um7/comms.h"
 #include "um7/registers.h"
 #include "um7/Reset.h"
+#include <algorithm>
 
 const char VERSION[10] = "0.0.2";   // um7_driver version
 
@@ -84,7 +85,7 @@ void configureVector3(um7::Comms* sensor, const um7::Accessor<RegT>& reg,
     reg.set_scaled(0, x);
     reg.set_scaled(1, y);
     reg.set_scaled(2, z);
-    if (sensor->sendWaitAck(reg))
+    if (sensor->sendWaitAck2(reg))
     {
       throw std::runtime_error("Unable to configure vector.");
     }
@@ -96,13 +97,92 @@ void configureVector3(um7::Comms* sensor, const um7::Accessor<RegT>& reg,
  * registers.
  */
 template<typename RegT>
-void sendCommand(um7::Comms* sensor, const um7::Accessor<RegT>& reg, std::string human_name)
+bool sendCommand(um7::Comms* sensor, const um7::Accessor<RegT>& reg, std::string human_name)
 {
-  ROS_INFO_STREAM("Sending command: " << human_name);
-  if (!sensor->sendWaitAck(reg))
-  {
-    throw std::runtime_error("Command to device failed.");
+  ROS_WARN("*** Sending command: %s", human_name.c_str());
+  std::string data_str;
+  uint8_t packet_type;
+  if (!sensor->sendWaitAck2(reg, &data_str, packet_type, true)){
+    // throw std::runtime_error("Command to device failed.");
+    return false;
   }
+  else {
+    // Check if the Command Failed bit of the Packet_Type byte is set 
+    bool cmd_failed = bool(packet_type & 0x01);
+    if (cmd_failed){
+      ROS_WARN("---- Command [%s](0x%02X) FAILED!", human_name.c_str(), reg.index);
+    } 
+    else{
+      ROS_WARN("---- Command [%s](0x%02X) SUCCEEDED!", human_name.c_str(), reg.index);
+    }
+
+    // If the command has a reply
+    if (!data_str.empty()){
+      ROS_WARN("*** Got a reply for %s: %s", human_name.c_str(), data_str.c_str());
+    }
+    return true;
+  }
+  
+}
+
+// This can be also used to check if we can communicate to the UM7
+bool verifyFirmwareVersion(um7::Comms* sensor, std::string& fw_str){
+  fw_str.clear();
+  if (sensor->serial_->isOpen()) {
+    um7::Registers r;
+    // Verify if the baud rate use to connect to the serial port is the same as the device's configured baud rate by querying the device firmware version
+    ROS_WARN("*** VALIDATING connection to UM7...");
+    if (sensor->sendWaitAck2(r.cmd_get_fw_revision, &fw_str, true))
+    {
+      ROS_WARN("---- UM7 Firmware version: %s", fw_str.c_str());
+      return true;
+    }
+    else {
+      ROS_ERROR("---- Validation FAILED! Serial baud (%s) probably is different from the device's baud setting.", std::to_string(sensor->serial_->getBaudrate()).c_str());
+      return false;
+    } 
+  }
+  return false;
+}
+
+// Check if UM7 is Overflowing. 
+// Overflow is when the UM7 is attempting to transmit data over the serial port faster than is allowed given the baud-rate.
+// -1 = error, 0 = no overflow(ok), 1 = overflow(not ok)
+int checkOverflow(um7::Comms* sensor){
+  if (sensor->serial_->isOpen()) {
+    um7::Registers r;
+    ROS_WARN("*** Reading DREG_HEALTH to check for overflow...");
+    std::string health_str;
+    try {
+      if( sensor->sendWaitAck2(r.health, &health_str, true) ) {
+        uint32_t health_reg = (uint32_t)health_str[0] << 24 |
+                              (uint32_t)health_str[1] << 16 |
+                              (uint32_t)health_str[2] << 8  |
+                              (uint32_t)health_str[3];
+        if (bool(health_reg & HEALTH_COM_OVERFLOW)){
+          ROS_ERROR("---- UM7 reports OVEFLOW! Reduce [update_rate] parameter or increase [baud] rate (change baud rate first via force_change_baud).");
+          return 1;
+        }
+        else {
+          ROS_WARN("---- Overflow not detected!");
+          return 0;
+        }
+      }
+      else {
+        ROS_ERROR("---- Unable to read DREG_HEALTH for OVERFLOW.");
+        return -1;
+      }
+    }
+    catch(const um7::SerialTimeout& e) {
+      ROS_ERROR("SerialTimeout: Reading parts of the health packet reply timed-out.");
+    }
+    catch(const um7::BadChecksum& e) {
+      ROS_ERROR("BadChecksum: Found the health packet, but with a bad checksum.");
+      throw;
+    }
+    
+  }
+  return -1;
 }
 
 
@@ -110,17 +190,83 @@ void sendCommand(um7::Comms* sensor, const um7::Accessor<RegT>& reg, std::string
  * Send configuration messages to the UM7, critically, to turn on the value outputs
  * which we require, and inject necessary configuration parameters.
  */
-void configureSensor(um7::Comms* sensor, ros::NodeHandle *private_nh)
+void configureSensor(um7::Comms* sensor, ros::NodeHandle *private_nh, int32_t& user_baud, int32_t& serial_baud)
 {
   um7::Registers r;
+  bool ignore_unacknowledged_configs;
+  private_nh->param<bool>("ignore_unacknowledged_configs", ignore_unacknowledged_configs, true);
 
-  uint32_t comm_reg = (BAUD_115200 << COM_BAUD_START);
-  r.communication.set(0, comm_reg);
-  if (!sensor->sendWaitAck(r.comrate2))
-  {
-    throw std::runtime_error("Unable to set CREG_COM_SETTINGS.");
+  
+  // DO NOT SET THE BAUD RATE OF THE DEVICE!!!!!
+  std::string fw_str;
+  bool verify_fw_before_config;
+  private_nh->param<bool>("verify_fw_before_config", verify_fw_before_config, false);
+  if ( !verifyFirmwareVersion(sensor, fw_str) ) {
+    if (verify_fw_before_config) {
+      throw um7::DeviceWrongBaud("Aborting configuration since [verify_fw_before_config] was set to True. Exiting...");
+    }
+    else {
+      ROS_ERROR("---- IGNORING firmware validation failure. Continuing connection...");
+    }
   }
 
+
+  // // Read the device's configured baud rate. At this point, the serial baud and device baud matches already.
+  // ROS_WARN("\n\nTrying to query UM7 Baud rate settings");
+  // std::string comm_settings_str;
+  // if (!sensor->sendWaitAck2(r.communication, &comm_settings_str, true))
+  // {
+  //   throw std::runtime_error("!!! Unable to read CREG_COM_SETTINGS for BAUD_RATE.");
+  // } 
+
+  // int32_t dev_baud;
+  // if (comm_settings_str.length() == 4)
+  // {
+  //   uint32_t comm_settings_uint32 = (uint32_t)comm_settings_str[0] << 24 |
+  //                                   (uint32_t)comm_settings_str[1] << 16 |
+  //                                   (uint32_t)comm_settings_str[2] << 8 |
+  //                                   (uint32_t)comm_settings_str[3];
+  //   // Extract from baud setting from comm settings register.
+  //   uint8_t dev_baud_uint8 = (uint8_t)((comm_settings_uint32 >> COM_BAUD_START) & COM_BAUD_MASK);
+    
+  //   // Validate that the just read baud setting has correct value (from datasheet).
+  //   if (dev_baud_uint8 >= um7::VALID_BAUD_RATES.size()) throw std::runtime_error("The configured value for BAUD_RATE is probably wrong.");
+    
+  //   // Access VALID_BAUD_RATES set like an array, to get to corresponding baud rate value 
+  //   auto it_dev_baud = std::next(um7::VALID_BAUD_RATES.begin(), dev_baud_uint8);
+  //   dev_baud = *it_dev_baud;
+  //   // ROS_WARN("**** a:%d, s:%d, u:%d, d:%d", (int)(sensor->serial_->getBaudrate()), (int)serial_baud, (int)user_baud, (int)dev_baud);
+  // }
+  // else
+  // {
+  //   throw std::runtime_error("Wrong data reply size for CREG_COM_SETTINGS for BAUD_RATE.");
+  // }
+  
+
+  // // Check if the device's configured baud rate is the same as what user has given. 
+  // if(dev_baud == user_baud)
+  // {
+  //   ROS_WARN("*** The user specified baud rate (%d) MATCHES the de ice's baud rate (%d)", user_baud, dev_baud);
+  // }
+  // else      // If dev_baud and user_baud DON'T match, correct the device's baud rate.
+  // {
+  //   ROS_WARN("*** The serial(%d) and device(%d) baud rates DON'T MATCH with the user baud (%d)!", serial_baud, dev_baud, user_baud);
+  //   ROS_WARN("*** Now setting the device to the user baud(%d), and will reconnect after!", user_baud);
+  //   // Find index of the user baud in um7::VALID_BAUD_RATES
+  //   auto it_= um7::VALID_BAUD_RATES.find(user_baud);
+  //   uint32_t user_baud_val = (uint32_t)std::distance(um7::VALID_BAUD_RATES.begin(), it_);
+  //   // ROS_WARN("**** user_baud(%d) user_baud_val: %d",user_baud, int(user_baud_val));
+
+  //   uint32_t comm_reg = (user_baud_val << COM_BAUD_START);    // uhh, this will actually change the whole register without preserving the other previous setting
+  //   // ROS_WARN("*** Setting CREG_COM_SETTINGS to: 0x%02X", comm_reg);
+  //   r.communication.set(0, comm_reg);
+
+  //   // We don't need to wait for ack when we change the baud rate, since the reply will be in a different baudrate, thus unreadable.
+  //   sensor->send(r.communication);
+  //   throw um7::DeviceBaudChanged("We just updated UM7 Baud setting to user_baud (" +std::to_string(user_baud) + ").");     // This will be caught by main, and will reconnect to serial using user_baud
+  // }
+  
+  ROS_WARN("** Updating configuration registers...");
   // set the broadcast rate of the device
   int rate;
   private_nh->param<int>("update_rate", rate, 20);
@@ -128,51 +274,152 @@ void configureSensor(um7::Comms* sensor, ros::NodeHandle *private_nh)
   {
     ROS_WARN("Potentially unsupported update rate of %d", rate);
   }
-
   uint32_t rate_bits = static_cast<uint32_t>(rate);
-  ROS_INFO("Setting update rate to %uHz", rate);
-  uint32_t raw_rate = (rate_bits << RATE2_ALL_RAW_START);
+  
+
+  ROS_WARN("*** Trying to change CREG_COM_RATES1");
+  uint32_t raw_rate_separate = 0;
+  ROS_WARN("**** Setting update rate (separate) to 0 Hz (0x%08X)", raw_rate_separate);
+  r.comrate1.set(0, raw_rate_separate);
+  if (!sensor->sendWaitAck2(r.comrate1))
+  {
+    if (!ignore_unacknowledged_configs) {
+      throw std::runtime_error("Unable to set CREG_COM_RATES1.");
+    }
+    else {
+      ROS_ERROR("---- Ignoring unacknowledged configuration!");
+    }
+
+  }
+  else {
+    ROS_WARN("---- OK CREG_COM_RATES1");
+  }
+
+
+  ROS_WARN("*** Trying to change CREG_COM_RATES2");
+  uint32_t raw_rate = 0;        //(rate_bits << RATE2_ALL_RAW_START);
+  ROS_WARN("**** Setting update rate to 0 Hz (0x%08X)", raw_rate);
   r.comrate2.set(0, raw_rate);
-  if (!sensor->sendWaitAck(r.comrate2))
+  if (!sensor->sendWaitAck2(r.comrate2))
   {
-    throw std::runtime_error("Unable to set CREG_COM_RATES2.");
+    if (!ignore_unacknowledged_configs) {
+      throw std::runtime_error("Unable to set CREG_COM_RATES2.");
+    }
+    else {
+      ROS_ERROR("---- Ignoring unacknowledged configuration!");
+    }
+
+  }
+  else {
+    ROS_WARN("---- OK CREG_COM_RATES2");
   }
 
+
+  // REDUNDANT since we will be setting CREG_COM_RATES4 properly
+  // ROS_WARN("*** Trying to change CREG_COM_RATES3");
+  // uint32_t proc_rate_separate = 0;
+  // ROS_WARN("**** Setting update rate (separate) to 0Hz (0x%08X)", proc_rate_separate);
+  // r.comrate3.set(0, proc_rate_separate);
+  // if (!sensor->sendWaitAck2(r.comrate3))
+  // {
+  //   if (!ignore_unacknowledged_configs) {
+  //     throw std::runtime_error("Unable to set CREG_COM_RATES3.");
+  //   }
+  //   else {
+  //     ROS_ERROR("---- Ignoring unacknowledged configuration!");
+  //   }
+
+  // }
+  // else {
+  //   ROS_WARN("---- OK CREG_COM_RATES3");
+  // }
+  
+
+  ROS_WARN("*** Trying to change CREG_COM_RATES4");
   uint32_t proc_rate = (rate_bits << RATE4_ALL_PROC_START);
+  ROS_WARN("**** Setting update rate to %d Hz (0x%08X)", rate, proc_rate);
   r.comrate4.set(0, proc_rate);
-  if (!sensor->sendWaitAck(r.comrate4))
+  if (!sensor->sendWaitAck2(r.comrate4))
   {
-    throw std::runtime_error("Unable to set CREG_COM_RATES4.");
+    if (!ignore_unacknowledged_configs) {
+      throw std::runtime_error("Unable to set CREG_COM_RATES4.");
+    }
+    else {
+      ROS_ERROR("---- Ignoring unacknowledged configuration!");
+    }
+  } 
+  else {
+    ROS_WARN("---- OK CREG_COM_RATES4");
   }
+  
 
+  ROS_WARN("*** Trying to change CREG_COM_RATES5");
   uint32_t misc_rate = (rate_bits << RATE5_EULER_START) | (rate_bits << RATE5_QUAT_START);
+  ROS_WARN("**** Setting update rate to %d Hz (0x%08X)", rate, misc_rate);
   r.comrate5.set(0, misc_rate);
-  if (!sensor->sendWaitAck(r.comrate5))
+  if (!sensor->sendWaitAck2(r.comrate5))
   {
-    throw std::runtime_error("Unable to set CREG_COM_RATES5.");
+    if (!ignore_unacknowledged_configs) {
+      throw std::runtime_error("Unable to set CREG_COM_RATES5.");
+    }
+    else {
+      ROS_ERROR("---- Ignoring unacknowledged configuration!");
+    }
   }
+  else {
+    ROS_WARN("---- OK CREG_COM_RATES5");
+  }
+  
 
+  ROS_WARN("*** Trying to change CREG_COM_RATES6");
   uint32_t health_rate = (5 << RATE6_HEALTH_START);  // note:  5 gives 2 hz rate
+  ROS_WARN("**** Setting update rate to 5 Hz (0x%08X)", health_rate);
   r.comrate6.set(0, health_rate);
-  if (!sensor->sendWaitAck(r.comrate6))
+  if (!sensor->sendWaitAck2(r.comrate6))
   {
-    throw std::runtime_error("Unable to set CREG_COM_RATES6.");
+    if (!ignore_unacknowledged_configs) {
+      throw std::runtime_error("Unable to set CREG_COM_RATES6.");
+    }
+    else {
+      ROS_ERROR("---- Ignoring unacknowledged configuration!");
+    }
+  }
+  else {
+    ROS_WARN("---- OK CREG_COM_RATES6");
+  }
+  
+
+  ROS_WARN("*** Trying to change CREG_COM_RATES7");
+  uint32_t nmea_rate = 0;
+  ROS_WARN("**** Setting update rate to 0 Hz (0x%08X)", nmea_rate);
+  r.comrate7.set(0, nmea_rate);
+  if (!sensor->sendWaitAck2(r.comrate7))
+  {
+    if (!ignore_unacknowledged_configs) {
+      throw std::runtime_error("Unable to set CREG_COM_RATES7.");
+    }
+    else {
+      ROS_ERROR("---- Ignoring unacknowledged configuration!");
+    }
+  }
+  else {
+    ROS_WARN("---- OK CREG_COM_RATES7");
   }
 
-
+  ROS_WARN("*** Trying to change CREG_MISC_SETTINGS");
   // Options available using parameters)
   uint32_t misc_config_reg = 0;  // initialize all options off
-
   // Optionally disable mag updates in the sensor's EKF.
   bool mag_updates;
   private_nh->param<bool>("mag_updates", mag_updates, true);
   if (mag_updates)
   {
     misc_config_reg |= MAG_UPDATES_ENABLED;
+    ROS_WARN("**** Including magnetometer updates from EKF.");
   }
   else
   {
-    ROS_WARN("Excluding magnetometer updates from EKF.");
+    ROS_WARN("**** Excluding magnetometer updates from EKF.");
   }
 
   // Optionally enable quaternion mode .
@@ -181,22 +428,57 @@ void configureSensor(um7::Comms* sensor, ros::NodeHandle *private_nh)
   if (quat_mode)
   {
     misc_config_reg |= QUATERNION_MODE_ENABLED;
+    ROS_WARN("**** Including quaternion mode.");
   }
   else
   {
-    ROS_WARN("Excluding quaternion mode.");
+    ROS_WARN("**** Excluding quaternion mode.");
   }
 
   r.misc_config.set(0, misc_config_reg);
-  if (!sensor->sendWaitAck(r.misc_config))
+  if (!sensor->sendWaitAck2(r.misc_config))
   {
-    throw std::runtime_error("Unable to set CREG_MISC_SETTINGS.");
+    if (!ignore_unacknowledged_configs) {
+      throw std::runtime_error("Unable to set CREG_MISC_SETTINGS.");
+    }
+    else {
+      ROS_ERROR("---- Ignoring unacknowledged configuration!");
+    }
   }
+  else {
+    ROS_WARN("---- OK CREG_MISC_SETTINGS");
+  }
+  
 
   // Optionally disable performing a zero gyros command on driver startup.
   bool zero_gyros;
   private_nh->param<bool>("zero_gyros", zero_gyros, true);
   if (zero_gyros) sendCommand(sensor, r.cmd_zero_gyros, "zero gyroscopes");
+
+  checkOverflow(sensor);
+
+  bool flash_config;
+  private_nh->param<bool>("flash_config", flash_config, false);
+  if(flash_config)
+  {
+    ROS_WARN("Flashing the settings...");
+    if (!sensor->sendWaitAck2(r.cmd_flash_commit, true))
+    {
+      if (!ignore_unacknowledged_configs) {
+        throw std::runtime_error("Unable to FLASH_COMMIT!");
+      }
+      else {
+        ROS_ERROR("---- Ignoring unacknowledged configuration!");
+      }
+    }
+    else {
+      ROS_WARN("---- Flashing SUCCESS!!!");
+    }
+  }
+
+
+  ROS_WARN("******* UM7 Configuration done!!! *******");
+  ROS_WARN("*****************************************\n");
 }
 
 
@@ -427,15 +709,62 @@ int main(int argc, char **argv)
 
   // Load parameters from private node handle.
   std::string port;
-  int32_t baud;
+  int32_t user_baud, serial_baud;
+  int receive_timeout_ms;
+  std::set<int32_t> tried_baud_rates, valid_unix_baud_rates;
+  std::set_intersection(um7::VALID_BAUD_RATES.begin(),
+                        um7::VALID_BAUD_RATES.end(),
+                        um7::UNIX_BAUD_RATES.begin(),
+                        um7::UNIX_BAUD_RATES.end(),
+                        std::inserter(valid_unix_baud_rates, valid_unix_baud_rates.end()));
+  
 
   ros::NodeHandle imu_nh("imu"), private_nh("~");
   private_nh.param<std::string>("port", port, "/dev/ttyUSB0");
-  private_nh.param<int32_t>("baud", baud, 115200);
+  private_nh.param<int32_t>("baud", user_baud, 115200);
+  private_nh.param<int>("receive_timeout_ms", receive_timeout_ms, 300);
+
+  // Check if the baud rate is valid
+  if(um7::VALID_BAUD_RATES.count(user_baud) && um7::UNIX_BAUD_RATES.count(user_baud))
+  {
+    ROS_DEBUG("Baud rate (%d) is valid", user_baud);
+    serial_baud = user_baud;
+  }
+  else
+  {
+    std::string valid_bauds_str;
+    for (auto it=valid_unix_baud_rates.begin(); it != valid_unix_baud_rates.end(); ++it){
+      if (it != valid_unix_baud_rates.begin()){
+        valid_bauds_str += ", ";
+      }
+      valid_bauds_str += std::to_string(*it);
+    }
+
+    if(um7::VALID_BAUD_RATES.count(user_baud)){
+      ROS_ERROR("Baud rate (%d) is SUPPORTED BY UM7, but is NOT SUPPORTED by UNIX. Valid rates: %s. Now exiting...", user_baud, valid_bauds_str.c_str());
+    } 
+    else
+    {
+      ROS_ERROR("Baud rate (%d) is INVALID. Valid rates: %s. Now exiting...", user_baud, valid_bauds_str.c_str());
+    }
+    
+    ros::shutdown();
+    return -1;
+  }
+
+  // Check if timeout is valid
+  if(receive_timeout_ms >= 0)
+  {
+    ROS_WARN("Value for receive_timeout_ms: %d", receive_timeout_ms);
+  }
+  else
+  {
+    ROS_ERROR("Value for receive_timeout_ms should be an integer >= 0");
+  }
 
   serial::Serial ser;
   ser.setPort(port);
-  ser.setBaudrate(baud);
+  ser.setBaudrate(serial_baud);
   serial::Timeout to = serial::Timeout(50, 50, 0, 50, 0);
   ser.setTimeout(to);
 
@@ -495,30 +824,43 @@ int main(int argc, char **argv)
   imu_msg.orientation_covariance[4] = orientation_y_covar;
   imu_msg.orientation_covariance[8] = orientation_z_covar;
 
+  int32_t dev_baud;
+  // findDeviceBaud(ser, user_baud, serial_baud, dev_baud);
+
   // Real Time Loop
   bool first_failure = true;
   while (ros::ok())
   {
     try
     {
+      ser.setBaudrate(serial_baud);
+      // ROS_WARN("==========================");
+      // ROS_WARN("===== TRYING BAUD act: %d, ser_baud:%d , open:%d==", ser.getBaudrate(), serial_baud, (int)ser.isOpen());
+      // ros::Duration(1.0).sleep();
       ser.open();
+      ser.flush();
+      ser.flushInput();
+      ser.flushOutput();
+      // ROS_WARN("===== SER after opening: act: %d, ser_baud:%d, open:%d", ser.getBaudrate(), serial_baud, (int)ser.isOpen());
+      tried_baud_rates.insert(ser.getBaudrate());
     }
     catch (const serial::IOException& e)
     {
-        ROS_WARN("um7_driver was unable to connect to port %s.", port.c_str());
+        ROS_WARN("um7_driver was unable to connect to port %s, baud: %d.", port.c_str(), serial_baud);
     }
     if (ser.isOpen())
     {
-      ROS_INFO("um7_driver successfully connected to serial port %s.", port.c_str());
+      ROS_WARN("um7_driver successfully connected to serial port %s, baud: %d.", port.c_str(), serial_baud);
       first_failure = true;
       try
       {
-        um7::Comms sensor(&ser);
-        configureSensor(&sensor, &private_nh);
+        um7::Comms sensor(&ser, (unsigned int)receive_timeout_ms);
+        configureSensor(&sensor, &private_nh, user_baud, serial_baud);
         um7::Registers registers;
         ros::ServiceServer srv = imu_nh.advertiseService<um7::Reset::Request, um7::Reset::Response>(
             "reset", boost::bind(handleResetService, &sensor, _1, _2));
 
+        // ros::Time prev_time=ros::Time::now();
         while (ros::ok())
         {
           // triggered by arrival of last message packet
@@ -527,9 +869,36 @@ int main(int argc, char **argv)
             // Triggered by arrival of final message in group.
             imu_msg.header.stamp = ros::Time::now();
             publishMsgs(registers, &imu_nh, imu_msg, axes, use_magnetic_field_msg);
+
+            // double tdiff=(imu_msg.header.stamp - prev_time).toSec();
+            // double hz=0.0;
+            // if (tdiff>0.0){
+            //   hz = 1.0/tdiff;
+            // }
+            // prev_time = imu_msg.header.stamp;
+            
+            // ROS_WARN("time_now: %f, diff:%f, hz:%f", imu_msg.header.stamp.toSec(), tdiff, hz);
+
             ros::spinOnce();
           }
         }
+      }
+      catch(const um7::DeviceWrongBaud& e)
+      {
+        ROS_ERROR_STREAM(e.what());
+        if (ser.isOpen()) ser.close();
+        ros::shutdown();
+        return -1;
+      }
+      catch(const um7::DeviceBaudChanged& e)
+      {
+        // We changed the devices baud to the user_baud
+        if (ser.isOpen()) ser.close();
+        ROS_ERROR_STREAM(e.what());
+
+        // Reconnect to serial using the user baud rate
+        serial_baud = user_baud;
+        ros::Duration(1.0).sleep();
       }
       catch(const std::exception& e)
       {
@@ -538,6 +907,7 @@ int main(int argc, char **argv)
         ROS_INFO("Attempting reconnection after error.");
         ros::Duration(1.0).sleep();
       }
+      
     }
     else
     {
